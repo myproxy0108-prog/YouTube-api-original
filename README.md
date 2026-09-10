@@ -1,4 +1,4 @@
-# ⚡ YouTube Invidious-Compatible Turbo API (Cloudflare Workers)by Nemu
+# ⚡ YouTube ICT API (Cloudflare Workers)by Nemu
 
 YouTube公式APIキー（利用枠・課金制限）を一切使用せず、Cloudflare Workers 上で動作する Invidious 互換の高速 RESTful API エンジンです。  
 動画詳細、関連動画、コメント、チャンネル、プレイリスト、急上昇（トレンド）、およびショート動画（スワイプ次動画取得対応）を JSON 形式で提供します。
