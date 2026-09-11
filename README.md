@@ -1,178 +1,131 @@
-# ⚡ YouTube ICT API (Cloudflare Workers)by Nemu
+GitHub等の README.md にそのままコピペして使える、API仕様書（APIリファレンス）の完全版です。
 
-YouTube公式APIキー（利用枠・課金制限）を一切使用せず、Cloudflare Workers 上で動作する Invidious 互換の高速 RESTful API エンジンです。  
-動画詳細、関連動画、コメント、チャンネル、プレイリスト、急上昇（トレンド）、およびショート動画（スワイプ次動画取得対応）を JSON 形式で提供します。
+## 🚀 API リファレンス (API Documentation)
 
----
+本プロジェクトは Cloudflare Workers 上で動作する超高速・軽量な YouTube API バックエンドエンジンです。Invidious 互換のエンドポイントを備え、キャッシュ・自動再生・チャンネル各タブ・エラー153完全対策が組み込まれています。
 
-## 🌟 特徴
-
-- **API キー完全不要**: 制限や割当枠（Quota）を気にせず利用可能。
-- **Invidious スキーマ完全準拠**: 既存の Invidious クライアントアプリや自作フロントエンドにそのまま接続可能。
-- **高速応答**: エッジメモリキャッシュ（5分間）を内蔵し、同一リクエストには 0ms レベルで即返却。
-- **全エンドポイント CORS 対応**: `Access-Control-Allow-Origin: *` により、ブラウザのフロントエンド（SPA）から直叩き可能。
-- **追加読み込み（ページネーション）完全対応**: 検索・コメント・チャンネル動画で無限スクロール用トークン（`continuation`）を発行。
-- **ショート動画（Shorts）特化対応**: 現在の動画に加え、スワイプ用の次動画（3本）を自動抽出。
-- **埋め込みプレイヤー即時利用可**: 全動画オブジェクトに `youtube-nocookie.com` の自動再生対応 `embedUrl` を同梱。
+- **Base URL**: `https://<あなたのWorkerドメイン>.workers.dev`
+- **通信形式**: JSON (`Content-Type: application/json; charset=utf-8`)
+- **CORS**: 全オリジン対応 (`Access-Control-Allow-Origin: *`)
+- **埋め込みドメイン**: 全て `https://www.youtube-nocookie.com` に統一
 
 ---
 
-## 📡 ベース URL
+### 📌 エンドポイント一覧
 
-```text
-https://<あなたのWorkerサブドメイン>.workers.dev
+| メソッド | エンドポイント | 説明 |
+| :--- | :--- | :--- |
+| `GET` | `/api/v1/search` | キーワード検索（動画・ショート・再生リスト・0ms追加読込） |
+| `GET` | `/api/v1/channels/:id` | チャンネル情報（動画/ショート/再生リスト/ホーム ＆ 並べ替え） |
+| `GET` | `/api/v1/shorts/:id` | ショート動画詳細 ＆ 次の厳選3本シーケンス |
+| `GET` | `/api/v1/videos/:id` | 通常動画詳細 ＆ 関連動画 ＆ コメント一括ロード（目安3秒） |
+| `GET` | `/api/v1/comments/:id` | コメント一覧取得（重複ゼロ・次ページ対応） |
+| `GET` | `/api/v1/playlists/:id` | プレイリスト内の動画一覧取得 |
+| `GET` | `/api/v1/trending` | 急上昇・トレンド動画取得 |
 
-※ パス形式（/api/v1/...）およびクエリ形式（/?v=... など）の両方に対応しています。
+---
 
-📖 エンドポイント仕様
+### 1. 検索 (`/api/v1/search`)
+通常動画・ショート動画・プレイリストを網羅して検索します。
+投機的プリフェッチにより、2ページ目以降の追加読み込みは **0ms〜数ms（爆速）** で返却されます。
 
-1. 急上昇・トレンド動画 (/api/v1/trending)
+#### クエリパラメータ
+| パラメータ | 型 | 必須 | デフォルト | 説明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `q` | string | ○* | - | 検索キーワード (*追加読込時は不要) |
+| `continuation` | string | - | - | 続きを読み込むためのページネーショントークン |
+| `limit` | number | - | `30` | 取得件数 (最大 60) |
 
-日本国内で現在バズっているトレンド動画・ショートの一覧を取得します。
-
-  - Method: GET
-  - Path: /api/v1/trending
-  - クエリパラメータ: | パラメータ | 型 | デフォルト | 説明 | | :--- | :--- | :--- | :--- | | type |
-    string | default | ジャンル指定 (default: 総合, music: 音楽, gaming: ゲーム, movies: 映画)
-    |
-
-レスポンス例
-
-[
-  {
-    "type": "video",
-    "title": "急上昇の動画タイトル",
-    "videoId": "xxxxxxxxxxx",
-    "author": "チャンネル名",
-    "authorId": "UCxxxxxxxxxxxxxxxxxxxxxx",
-    "authorUrl": "/channel/UCxxxxxxxxxxxxxxxxxxxxxx",
-    "videoThumbnails": [
-      {
-        "quality": "maxres",
-        "url": "https://i.ytimg.com/vi/xxxxxxxxxxx/maxresdefault.jpg",
-        "width": 1280,
-        "height": 720
-      }
-    ],
-    "viewCount": 1250000,
-    "viewCountText": "125万 回視聴",
-    "publishedText": "14時間前",
-    "lengthSeconds": 345,
-    "liveNow": false
-  }
-]
-
-2. キーワード検索 (/api/v1/search)
-
-指定したキーワードで動画・ショート・プレイリストを横断検索します。
-
-  - Method: GET
-  - Path: /api/v1/search
-  - クエリパラメータ: | パラメータ | 型 | デフォルト | 説明 | | :--- | :--- | :--- | :--- | | q |
-    string | (必須) | 検索キーワード | | limit | number | 30 | 取得件数 (最大 60) | |
-    continuation | string | なし | 追加読み込み用トークン (次ページ取得時) |
-
-レスポンス例
-
+#### レスポンス例
+```json
 {
   "results": [
     {
       "type": "video",
-      "isShort": false,
-      "title": "通常動画タイトル",
-      "videoId": "xxxxxxxxxxx",
-      "author": "クリエイター名",
-      "authorId": "UCxxxxxxxxxxxxxxxxxxxxxx",
-      "authorUrl": "/channel/UCxxxxxxxxxxxxxxxxxxxxxx",
+      "videoId": "SX_ViT4Ra7k",
+      "title": "動画タイトル",
+      "author": "チャンネル名",
+      "authorId": "UC...",
+      "authorUrl": "/channel/UC...",
+      "thumbnail": "https://i.ytimg.com/vi/SX_ViT4Ra7k/hqdefault.jpg",
       "videoThumbnails": [ ... ],
-      "description": "概要文抜粋...",
-      "viewCount": 380000,
-      "viewCountText": "38万 回視聴",
+      "lengthSeconds": 245,
+      "viewCount": 150000,
+      "viewCountText": "15万 回視聴",
       "publishedText": "3日前",
-      "lengthSeconds": 240,
-      "embedUrl": "https://www.youtube-nocookie.com/embed/xxxxxxxxxxx?autoplay=1&mute=1"
+      "embedUrl": "https://www.youtube-nocookie.com/embed/SX_ViT4Ra7k?autoplay=1"
     },
     {
       "type": "short",
       "isShort": true,
-      "title": "ショート動画タイトル",
-      "videoId": "yyyyyyyyyyy",
-      "author": "チャンネル名",
-      "videoThumbnails": [ ... ],
-      "viewCount": 1200000,
-      "lengthSeconds": 30,
-      "embedUrl": "https://www.youtube-nocookie.com/embed/yyyyyyyyyyy?autoplay=1&mute=1&controls=0&loop=1&playlist=yyyyyyyyyyy&enablejsapi=1"
+      "videoId": "9f1rHt0W_Ak",
+      "title": "ショート動画タイトル #shorts",
+      "author": "クリエイター名",
+      "embedUrl": "https://www.youtube-nocookie.com/embed/9f1rHt0W_Ak?autoplay=1&mute=1&controls=0&loop=1&playlist=9f1rHt0W_Ak&playsinline=1&enablejsapi=1&rel=0"
     },
     {
       "type": "playlist",
-      "title": "プレイリスト名",
-      "playlistId": "PLxxxxxxxxxxxxxxxx",
-      "author": "作成者名",
-      "authorId": "UCxxxxxxxxxxxxxxxxxxxxxx",
-      "videoCount": 25,
+      "playlistId": "PL...",
+      "title": "再生リスト名",
+      "videoCount": 24,
       "thumbnail": "https://i.ytimg.com/vi/.../hqdefault.jpg"
     }
   ],
-  "continuation": "4qmF37qQGmoSI..."
+  "continuation": "4qmFsg..."
 }
 
-3. 通常動画詳細 & 関連動画 (/api/v1/videos/:id)
+2. チャンネル情報・コンテンツ (/api/v1/channels/:id)
 
-動画のタイトル、概要欄、チャンネル情報、高評価数、および右側に表示する関連動画一覧を取得します。
+UC... 形式のチャンネルIDはもちろん、@HikakinTV のようなカスタムハンドル名も0msキャッシュ付きで自動解決します。
+タブ選択および「新着順」「人気の動画」「古い順」の並べ替えに対応しています。
 
-  - Method: GET
-  - Path: /api/v1/videos/:videoId または /?v=:videoId
-  - クエリパラメータ: | パラメータ | 型 | デフォルト | 説明 | | :--- | :--- | :--- | :--- | | limit |
-    number | 15 | 関連動画の取得件数 | | continuation | string | なし | 関連動画の追加読み込み用トークン |
+パスパラメータ
 
-レスポンス例
+  - :id: チャンネルID (UCXuqSBlHAE6Xw-yeJA0Tunw) または ハンドル名 (@HikakinTV)
+
+クエリパラメータ
+
+| パラメータ          | 型      | デフォルト    | 選択肢・説明                                                                  |
+| :------------- | :----- | :------- | :---------------------------------------------------------------------- |
+| `tab`          | string | `videos` | タブ指定: `videos` (動画), `shorts` (ショート), `playlists` (再生リスト), `home` (ホーム) |
+| `sort`         | string | `latest` | 並べ替え: `latest` (新着順), `popular` (人気の動画), `oldest` (古い順) ※動画・ショートタブ時有効   |
+| `continuation` | string | \-       | タブ内の続きを読み込むトークン                                                         |
+| `limit`        | number | `30`     | 取得件数 (最大 60)                                                            |
+
+レスポンス例 (tab=playlists 時)
 
 {
-  "type": "video",
-  "title": "動画タイトル",
-  "videoId": "SX_ViT4Ra7k",
-  "videoThumbnails": [ ... ],
-  "description": "概要欄のテキスト全文...",
-  "descriptionHtml": "概要欄（HTMLタグ付き）...",
-  "publishedText": "4か月前",
-  "viewCount": 38400000,
-  "author": "米津玄師",
-  "authorId": "UCUCeZaZeJbEYAAzvMgrKOPQ",
-  "authorUrl": "/channel/UCUCeZaZeJbEYAAzvMgrKOPQ",
-  "authorThumbnails": [
+  "author": "HikakinTV",
+  "authorId": "UCXuqSBlHAE6Xw-yeJA0Tunw",
+  "authorUrl": "/channel/UCXuqSBlHAE6Xw-yeJA0Tunw",
+  "authorThumbnails": [ ... ],
+  "authorBanners": [ ... ],
+  "subCount": 19800000,
+  "description": "チャンネル説明文...",
+  "currentTab": "playlists",
+  "currentSort": "latest",
+  "tabs": ["home", "videos", "shorts", "playlists"],
+  "contents": [
     {
-      "url": "https://yt3.ggpht.com/...",
-      "width": 48,
-      "height": 48
+      "type": "playlist",
+      "title": "WBC2026 応援生配信",
+      "playlistId": "PL...",
+      "videoCount": 3,
+      "thumbnail": "https://i.ytimg.com/vi/.../hqdefault.jpg",
+      "author": "HikakinTV"
     }
   ],
-  "subCountText": "チャンネル登録者数 720万人",
-  "embedUrl": "https://www.youtube-nocookie.com/embed/SX_ViT4Ra7k?autoplay=1&mute=1",
-  "recommendedVideos": [
-    {
-      "videoId": "zzzzzzzzzzz",
-      "title": "次の関連動画タイトル",
-      "author": "関連動画のチャンネル名",
-      "authorId": "UC...",
-      "authorUrl": "/channel/UC...",
-      "lengthSeconds": 195,
-      "viewCountText": "120万 回視聴",
-      "viewCount": 1200000,
-      "videoThumbnails": [ ... ]
-    }
-  ],
-  "continuation": "4qmF37q..."
+  "continuation": "..."
 }
 
-4. ショート動画 & 次動画シーケンス (/api/v1/shorts/:id)
+3. ショート動画 (/api/v1/shorts/:id)
 
-ショート動画のメタデータと、スワイプ時に流れてくる次の動画リスト（3本）を一括取得します。
+ショート動画単体情報と、**次に再生すべき厳選3本（シーケンス）**を同時に返却します。 自動ループ再生用のnocookie
+URLがあらかじめ生成されています。
 
-  - Method: GET
-  - Path: /api/v1/shorts/:id または /api/v1/shorts (初期ショート自動選定)
-  - クエリパラメータ: | パラメータ | 型 | 説明 | | :--- | :--- | :--- | | sequenceParams |
-    string | スワイプ時の追加先読みトークン | | lastVideoId | string |
-    直前に再生していたショート動画のID（トークン切れ時の自動復旧用） |
+パスパラメータ
+
+  - :id: ショート動画ID (9f1rHt0W_Ak) ※未指定時はおすすめの初期ショートを返却
 
 レスポンス例
 
@@ -181,238 +134,108 @@ https://<あなたのWorkerサブドメイン>.workers.dev
   "type": "shorts",
   "current": {
     "id": "9f1rHt0W_Ak",
-    "title": "緊急事態発生！不良品",
-    "author": "アジーンTV",
-    "authorId": "UCxxxxxxxxxxxxxxxxxxxxxx",
-    "authorUrl": "/channel/UCxxxxxxxxxxxxxxxxxxxxxx",
-    "authorThumbnails": [
-      {
-        "url": "https://yt3.ggpht.com/...",
-        "width": 48,
-        "height": 48
-      }
-    ],
-    "likeCount": "1.2万",
+    "title": "ショート動画タイトル",
+    "author": "クリエイター名",
+    "authorId": "UC...",
+    "authorThumbnails": [ ... ],
+    "likeCount": "12万",
     "commentCount": "コメント",
-    "embedUrl": "https://www.youtube-nocookie.com/embed/9f1rHt0W_Ak?autoplay=1&mute=1&controls=0&loop=1&playlist=9f1rHt0W_Ak&enablejsapi=1",
-    "videoThumbnails": [
-      {
-        "quality": "vertical",
-        "url": "https://i.ytimg.com/vi/9f1rHt0W_Ak/oardefault.jpg",
-        "width": 720,
-        "height": 1280
-      }
-    ]
+    "embedUrl": "https://www.youtube-nocookie.com/embed/9f1rHt0W_Ak?autoplay=1&mute=1&controls=0&loop=1&playlist=9f1rHt0W_Ak&playsinline=1&enablejsapi=1&rel=0",
+    "videoThumbnails": [ ... ]
   },
   "sequence": [
     {
-      "id": "Hnk48gYYxSQ",
-      "title": "だから予想外すぎるって #shorts",
-      "author": "チャンネル名",
-      "thumbnail": "https://i.ytimg.com/vi/Hnk48gYYxSQ/oardefault.jpg",
-      "embedUrl": "https://www.youtube-nocookie.com/embed/Hnk48gYYxSQ?autoplay=1&mute=1&controls=0&loop=1&playlist=Hnk48gYYxSQ&enablejsapi=1"
-    },
-    {
-      "id": "ISHmwrPXjFk",
-      "title": "関西の人は、標準語で言えないらしい。",
-      "author": "チャンネル名",
-      "thumbnail": "https://i.ytimg.com/vi/ISHmwrPXjFk/oardefault.jpg",
-      "embedUrl": "https://www.youtube-nocookie.com/embed/ISHmwrPXjFk?autoplay=1&mute=1&controls=0&loop=1&playlist=ISHmwrPXjFk&enablejsapi=1"
-    },
-    {
-      "id": "63CPpM9uvjA",
-      "title": "プールの中でうんち💩する人って本当にいるの？",
-      "author": "チャンネル名",
-      "thumbnail": "https://i.ytimg.com/vi/63CPpM9uvjA/oardefault.jpg",
-      "embedUrl": "https://www.youtube-nocookie.com/embed/63CPpM9uvjA?autoplay=1&mute=1&controls=0&loop=1&playlist=63CPpM9uvjA&enablejsapi=1"
+      "id": "abc12345678",
+      "title": "次のショート1",
+      "author": "投稿者名",
+      "thumbnail": "https://i.ytimg.com/vi/abc12345678/hqdefault.jpg",
+      "embedUrl": "https://www.youtube-nocookie.com/embed/abc12345678?..."
     }
   ]
 }
 
-5. コメント一覧 (/api/v1/comments/:id)
+4. 通常動画詳細 ＆ コメント同梱ロード (/api/v1/videos/:id)
 
-指定した動画のコメント一覧を取得します。YouTube 最新仕様の entityBatchUpdate に対応し、本文・投稿者名・高評価数が完全に復元されます。
+動画を開いた瞬間に快適に視聴できるよう、動画情報・おすすめ動画・初期コメント（30件）を最大3秒目安で並行一括ロードして返します。フロント側でコメント用の別リクエストを待つ必要がありません。
 
-  - Method: GET
-  - Path: /api/v1/comments/:videoId または /?comments=:videoId
-  - クエリパラメータ: | パラメータ | 型 | デフォルト | 説明 | | :--- | :--- | :--- | :--- | | limit |
-    number | 50 | 取得件数 (最大 60) | | continuation | string | なし | コメント追加読み込み用トークン
-    |
+パスパラメータ
+
+  - :id: 動画ID 11桁 (SX_ViT4Ra7k)
 
 レスポンス例
 
 {
-  "commentCount": 296610,
+  "type": "video",
+  "title": "動画タイトル",
   "videoId": "SX_ViT4Ra7k",
+  "thumbnail": "https://i.ytimg.com/vi/SX_ViT4Ra7k/hqdefault.jpg",
+  "description": "動画の説明欄テキスト...",
+  "publishedText": "2026/01/15",
+  "viewCount": 2400000,
+  "author": "アーティスト名",
+  "authorId": "UC...",
+  "subCountText": "チャンネル登録者数 500万人",
+  "embedUrl": "https://www.youtube-nocookie.com/embed/SX_ViT4Ra7k?autoplay=1",
+  "recommendedVideos": [ ... ],
+  "commentCount": 3500,
   "comments": [
     {
-      "author": "投稿者ユーザー名",
-      "authorUrl": "/channel/UC...",
-      "authorId": "UC...",
-      "authorThumbnails": [
-        {
-          "url": "https://yt3.ggpht.com/...",
-          "width": 48,
-          "height": 48
-        }
-      ],
-      "commentId": "UgxeBLC5VBj2_LdUtrR4AaABAg",
-      "authorIsChannelOwner": false,
-      "content": "毎朝聴いて元気をもらっています！最高です！",
-      "contentHtml": "毎朝聴いて元気をもらっています！最高です！",
-      "published": 0,
-      "publishedText": "3週間前",
-      "likeCount": 352,
-      "replyCount": 4,
-      "isPinned": false
+      "author": "ユーザー名",
+      "authorThumbnails": [ ... ],
+      "content": "コメント本文",
+      "publishedText": "2日前",
+      "likeCount": 120
     }
   ],
-  "continuation": "4qmF37qQG..."
+  "commentsContinuation": "コメント2ページ目用トークン"
 }
 
-6. チャンネル情報 & 投稿動画 (/api/v1/channels/:id)
+5. コメント単体取得 (/api/v1/comments/:id)
 
-チャンネルの基本情報（バナー、アバター、登録者数、概要欄）と投稿動画一覧を取得します。
+動画のコメント一覧を取得します。返信ボタンのトークン誤爆を防ぎ、重複のない安定したページネーションを実現しています。
 
-  - Method: GET
-  - Path: /api/v1/channels/:channelId または /?channel=:channelId
-  - 対応ID形式: UCxxxxxxxxxxxxxxxxxxxxxx (Channel ID) または @username (ハンドル名)
-  - クエリパラメータ: | パラメータ | 型 | デフォルト | 説明 | | :--- | :--- | :--- | :--- | | limit |
-    number | 30 | 動画取得件数 | | continuation | string | なし | 過去動画の追加読み込み用トークン |
+パスパラメータ / クエリパラメータ
 
-レスポンス例
+  - :id: 動画ID 11桁
+  - continuation (string, optional): コメントの次ページトークン
+  - limit (number, default: 50): 取得件数
 
-{
-  "author": "米津玄師",
-  "authorId": "UCUCeZaZeJbEYAAzvMgrKOPQ",
-  "authorUrl": "/channel/UCUCeZaZeJbEYAAzvMgrKOPQ",
-  "authorThumbnails": [
-    {
-      "url": "https://yt3.googleusercontent.com/...",
-      "width": 512,
-      "height": 512
-    }
-  ],
-  "authorBanners": [
-    {
-      "url": "https://yt3.googleusercontent.com/...",
-      "width": 1280,
-      "height": 720
-    }
-  ],
-  "subCount": 7200000,
-  "description": "米津玄師 公式YouTubeチャンネル",
-  "descriptionHtml": "米津玄師 公式YouTubeチャンネル",
-  "latestVideos": [
-    {
-      "type": "video",
-      "title": "最新投稿動画タイトル",
-      "videoId": "xxxxxxxxxxx",
-      "author": "米津玄師",
-      "authorId": "UCUCeZaZeJbEYAAzvMgrKOPQ",
-      "authorUrl": "/channel/UCUCeZaZeJbEYAAzvMgrKOPQ",
-      "videoThumbnails": [ ... ],
-      "viewCount": 2400000,
-      "viewCountText": "240万 回視聴",
-      "publishedText": "2週間前",
-      "lengthSeconds": 210,
-      "liveNow": false
-    }
-  ],
-  "continuation": "4qmF37q..."
-}
+6. プレイリスト詳細 (/api/v1/playlists/:id)
 
-7. プレイリスト情報 (/api/v1/playlists/:id)
+指定した再生リストに含まれる動画一覧を取得します。
 
-指定したプレイリストのタイトル、作成者、曲数、および全収録曲リストを取得します。
+パスパラメータ
 
-  - Method: GET
-  - Path: /api/v1/playlists/:playlistId または /?playlist=:playlistId
-  - 対応ID形式: PLxxxxxxxxxxxxxxxx または VLPLxxxxxxxxxxxxxxxx
+  - :id: プレイリストID (PL... または VL...)
+  - limit (number, default: 50): 取得上限数
 
-レスポンス例
+7. 急上昇・トレンド (/api/v1/trending)
 
-{
-  "title": "米津玄師 - MVまとめ",
-  "playlistId": "PLlaN88aKQSexv-j9Q9_Ovd2gU_b7I1JbV",
-  "author": "作成者名",
-  "authorId": "UC...",
-  "authorUrl": "/channel/UC...",
-  "authorThumbnails": [ ... ],
-  "description": "プレイリスト説明文...",
-  "descriptionHtml": "プレイリスト説明文...",
-  "videoCount": 32,
-  "videos": [
-    {
-      "title": "Lemon",
-      "videoId": "SX_ViT4Ra7k",
-      "author": "米津玄師",
-      "authorId": "UCUCeZaZeJbEYAAzvMgrKOPQ",
-      "authorUrl": "/channel/UCUCeZaZeJbEYAAzvMgrKOPQ",
-      "videoThumbnails": [ ... ],
-      "index": 0,
-      "lengthSeconds": 270
-    }
-  ]
-}
+日本国内の急上昇動画を取得します。
 
-🛠️ クライアント実装例 (JavaScript / SPA)
+クエリパラメータ
 
-無限スクロールの基本パターン
+  - type: default (急上昇全体), music (音楽), gaming (ゲーム)
 
-const API_BASE = "https://あなたのWorker.workers.dev";
-let nextToken = null;
+⚠️ フロントエンド実装時の注意点（エラー153対策）
 
-// 1. 初回読み込み (50件)
-async function fetchInitialVideos(query) {
-  const res = await fetch(`${API_BASE}/api/v1/search?q=${encodeURIComponent(query)}&limit=50`);
-  const data = await res.json();
-  renderVideos(data.results);
-  nextToken = data.continuation; // 次ページ用トークンを保管
-}
+YouTubeの埋め込みプレイヤーが 動画プレイヤーの設定エラー (Error 153) を吐く現象を防ぐため、HTML側で必ず以下の設定を行ってください。
 
-// 2. 最下部到達時の追加読み込み
-async function loadMoreVideos() {
-  if (!nextToken) return; // 終端なら終了
-  const res = await fetch(`${API_BASE}/api/v1/search?continuation=${encodeURIComponent(nextToken)}`);
-  const data = await res.json();
-  appendVideos(data.results);
-  nextToken = data.continuation; // トークンを更新
-}
+1.  HTML <head> 内の Referrer 設定:
 
-ショート動画スワイプの基本パターン
+    <!-- no-referrer だとエラー153が発生するため、公式推奨値を指定 -->
+    <meta name="referrer" content="strict-origin-when-cross-origin">
 
-let currentShort = null;
-let queue = [];
+2.  <iframe> の属性設定:
 
-// ショートを開く
-async function openShort(id) {
-  const res = await fetch(`${API_BASE}/api/v1/shorts/${id}`);
-  const data = await res.json();
-  
-  currentShort = data.current;
-  queue = data.sequence; // 厳選3本をキューに保持
-  
-  // 縦型プレイヤーに即時自動再生セット
-  document.getElementById("player").src = currentShort.embedUrl;
-}
-
-// 下から上にスワイプした時 (次のショートへ)
-async function onSwipeNext() {
-  if (queue.length === 0) return;
-  const nextVideo = queue.shift();
-  // 次の動画IDでAPIを再フェッチし、完全なチャンネル名・高評価・新しい次3本を数珠繋ぎ取得
-  await openShort(nextVideo.id);
-}
-
-🚀 デプロイ手順
-
-1.  Cloudflare Dashboard にログインし、Workers & Pages を選択。
-2.  「Create Worker」 をクリック。
-3.  提供された api.worker のコードを貼り付け、「Save and deploy」 をクリックします。
-4.  生成されたドメイン（https://xxxx.workers.dev）にブラウザでアクセスすると、ビジュアル動作確認用のデモ画面が表示されます。
-
-# ⚠️注意点
+    <iframe 
+      src="https://www.youtube-nocookie.com/embed/VIDEO_ID?autoplay=1" 
+      frameborder="0" 
+      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+      allowfullscreen 
+      referrerpolicy="strict-origin-when-cross-origin">
+    </iframe>
+#注意点
 1. 自作発言をしないでください
 2. また、ここにベタ書きしているapiを使用しないでください
 3. streamには対応していません、現存のinvidiousを少しでも軽くするために使用してください
