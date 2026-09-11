@@ -1,8 +1,8 @@
 // =======================================================
-// 超高速インメモリ ＆ ハンドルキャッシュ (0ms即引き)
+// 超高速インメモリ ＆ ハンドル永久キャッシュ (0ms即引き)
 // =======================================================
 const MEMORY_CACHE = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10分間キャッシュ
 const CHANNEL_ID_CACHE = new Map();
 
 function getCached(key) {
@@ -14,25 +14,30 @@ function getCached(key) {
 }
 
 function setCache(key, data) {
-  if (MEMORY_CACHE.size > 500) {
+  if (MEMORY_CACHE.size > 800) {
     const firstKey = MEMORY_CACHE.keys().next().value;
     MEMORY_CACHE.delete(firstKey);
   }
   MEMORY_CACHE.set(key, { data, time: Date.now() });
 }
 
+// 検索追加読み込み専用の正規化キャッシュキー
+function getSearchContinuationKey(token) {
+  return `search_cont_${token.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ★【動画プレイヤー設定エラー完全解消】no-referrer を廃止し strict-origin-when-cross-origin を適用
+    // --- 全レスポンス nocookie & CORS & キャッシュヘッダー ---
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=600, stale-while-revalidate=86400",
-      "Referrer-Policy": "strict-origin-when-cross-origin"
+      "Referrer-Policy": "no-referrer"
     };
 
     if (request.method === "OPTIONS") {
@@ -41,18 +46,6 @@ export default {
 
     const path = url.pathname;
     const cacheKey = url.pathname + url.search;
-
-    const cachedData = getCached(cacheKey);
-    if (cachedData && request.method === "GET") {
-      return new Response(JSON.stringify(cachedData), { headers: corsHeaders });
-    }
-
-    const cache = caches.default;
-    const cacheUrl = new URL(request.url);
-    const edgeCached = await cache.match(cacheUrl.toString());
-    if (edgeCached && request.method === "GET") {
-      return edgeCached;
-    }
 
     // パラメータ解析
     let videoId = url.searchParams.get("v") || url.searchParams.get("videoId");
@@ -73,7 +66,7 @@ export default {
       continuation = continuation.replace(/ /g, "+");
     }
 
-    // パス判定
+    // パスルーティング
     const shortMatch = path.match(/^\/api\/v1\/shorts\/([a-zA-Z0-9_-]{11})/);
     if (shortMatch) shortId = shortMatch[1];
     const isShortsRoot = path === "/api/v1/shorts" || path === "/api/v1/shorts/";
@@ -86,37 +79,85 @@ export default {
     const playlistMatch = path.match(/^\/api\/v1\/playlists\/([^\/?#]+)/);
     if (playlistMatch) playlistId = playlistMatch[1];
 
+    // ★ 1. 検索追加読み込みの超高速判定 (先読みキャッシュが存在すれば 0ms で即返却)
+    if (continuation && (path.startsWith("/api/v1/search") || (!channelId && !commentsVideoId))) {
+      const contKey = getSearchContinuationKey(continuation);
+      const cachedCont = getCached(contKey);
+      if (cachedCont && request.method === "GET") {
+        // 次の次（チェーン）を裏で投機的プリフェッチ
+        if (cachedCont.continuation) {
+          triggerSearchPrefetch(ctx, url.origin, cachedCont.continuation, limit, corsHeaders);
+        }
+        return new Response(JSON.stringify(cachedCont), { headers: corsHeaders });
+      }
+    }
+
+    // 2. 通常メモリキャッシュ判定 (0ms)
+    const cachedData = getCached(cacheKey);
+    if (cachedData && request.method === "GET") {
+      return new Response(JSON.stringify(cachedData), { headers: corsHeaders });
+    }
+
+    // 3. Cloudflare グローバルエッジキャッシュ判定
+    const cache = caches.default;
+    const cacheUrl = new URL(request.url);
+    const edgeCached = await cache.match(cacheUrl.toString());
+    if (edgeCached && request.method === "GET") {
+      return edgeCached;
+    }
+
     try {
       let responseData = null;
 
+      // 1. トレンド
       if (isTrending) {
         responseData = await fetchTrendingVideosReliable(trendType);
-      } else if (shortId || isShortsRoot || url.searchParams.has("shorts") || url.searchParams.has("short")) {
+      }
+      // 2. ショート動画 (全部 nocookie ＆ 自動再生)
+      else if (shortId || isShortsRoot || url.searchParams.has("shorts") || url.searchParams.has("short")) {
         const targetId = shortId || await getInitialShortIdFast();
         responseData = await fetchFastShortWith3Next(targetId);
-      } else if (commentsVideoId) {
+      }
+      // 3. コメント単体取得 (追加読み込み対応)
+      else if (commentsVideoId || (continuation && path.includes("/comments"))) {
         responseData = await fetchInvidiousComments(commentsVideoId, limit, continuation);
-      } else if (videoId) {
-        responseData = await fetchFastVideo(videoId, limit, continuation);
-      } else if (channelId || (continuation && path.includes("/channels"))) {
+      }
+      // ★ 4. 通常動画詳細 (目安3秒ガード ＆ コメント・動画詳細の同時一括ロード)
+      else if (videoId) {
+        responseData = await fetchFastVideoWithDetailsAndComments(videoId, limit, continuation);
+      }
+      // 5. チャンネル情報 & 各タブ (人気順・古い順・再生リスト完全対応)
+      else if (channelId || (continuation && path.includes("/channels"))) {
         responseData = await fetchInvidiousChannel(channelId || "", tab, sort, limit, continuation);
-      } else if (playlistId) {
+      }
+      // 6. プレイリスト単体
+      else if (playlistId) {
         responseData = await fetchInvidiousPlaylist(playlistId, limit);
-      } else if (query || continuation || path.startsWith("/api/v1/search")) {
+      }
+      // ★ 7. 検索 (追加読み込み爆速化 ＆ 無限連鎖プリフェッチ)
+      else if (query || continuation || path.startsWith("/api/v1/search")) {
         responseData = await fetchFastSearch(query || "", limit, continuation);
-      } else if (request.headers.get("Accept")?.includes("text/html")) {
+
+        // 次ページのトークンがあれば裏で先読みしてエッジキャッシュに事前保存 (0ms応答化)
+        if (responseData.continuation) {
+          triggerSearchPrefetch(ctx, url.origin, responseData.continuation, limit, corsHeaders);
+        }
+      }
+      // デモ UI
+      else if (request.headers.get("Accept")?.includes("text/html")) {
         return new Response(renderDemoHtml(url.origin), {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
-      } else {
+      }
+      else {
         responseData = {
           status: "ready",
-          api: "Invidious Ultra Turbo Engine v16 (Error 153 & All Bugs Fixed)",
+          api: "Invidious Ultra Turbo Engine v18 (Lightning Search & Auto-Loaded Watch)",
           endpoints: [
             "/api/v1/search?q=:query",
             "/api/v1/channels/:id?tab=(videos|shorts|playlists|home)&sort=(latest|popular|oldest)",
             "/api/v1/shorts/:id",
-            "/api/v1/videos/:id",
+            "/api/v1/videos/:id (目安3秒・コメント自動同梱)",
             "/api/v1/comments/:id",
             "/api/v1/playlists/:id",
             "/api/v1/trending"
@@ -126,9 +167,11 @@ export default {
 
       setCache(cacheKey, responseData);
       const res = new Response(JSON.stringify(responseData), { headers: corsHeaders });
+      
       if (request.method === "GET") {
         ctx.waitUntil(cache.put(cacheUrl.toString(), res.clone()));
       }
+
       return res;
 
     } catch (e) {
@@ -141,48 +184,100 @@ export default {
 };
 
 // =======================================================
-// InnerTube 通信エンジン
+// ★ 投機的検索プリフェッチ（バックグラウンドで先読み）
+// =======================================================
+function triggerSearchPrefetch(ctx, origin, nextToken, limit, corsHeaders) {
+  if (!nextToken) return;
+  const contKey = getSearchContinuationKey(nextToken);
+  if (getCached(contKey)) return;
+
+  ctx.waitUntil((async () => {
+    try {
+      const data = await fetchFastSearch("", limit, nextToken);
+      if (data && data.results && data.results.length > 0) {
+        setCache(contKey, data);
+        const cache = caches.default;
+        const cacheUrl = new URL(`/api/v1/search?continuation=${encodeURIComponent(nextToken)}`, origin);
+        const res = new Response(JSON.stringify(data), { headers: corsHeaders });
+        await cache.put(cacheUrl.toString(), res);
+      }
+    } catch (e) {}
+  })());
+}
+
+// =======================================================
+// ★ 403/429 自己修復通信エンジン (内部自動リトライ)
 // =======================================================
 const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
-async function callInnerTube(endpoint, payload) {
-  const res = await fetch(`https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_API_KEY}`, {
-    method: "POST",
-    keepalive: true,
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "X-YouTube-Client-Name": "1",
-      "X-YouTube-Client-Version": "2.20240401.00.00",
-      "Accept-Encoding": "gzip, deflate, br"
-    },
-    body: JSON.stringify({
-      context: {
-        client: {
-          hl: "ja",
-          gl: "JP",
-          clientName: "WEB",
-          clientVersion: "2.20240401.00.00"
-        }
-      },
-      ...payload
-    })
-  });
+async function callInnerTube(endpoint, payload, retryCount = 0, customSignal = null) {
+  const url = `https://www.youtube.com/youtubei/v1/${endpoint}?key=${INNERTUBE_API_KEY}`;
+  
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "X-YouTube-Client-Name": "1",
+    "X-YouTube-Client-Version": "2.20240625.01.00",
+    "Origin": "https://www.youtube.com",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
+  };
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`YouTube API Error [${endpoint}]: HTTP ${res.status} - ${errText.slice(0, 100)}`);
+  const body = {
+    context: {
+      client: {
+        hl: "ja",
+        gl: "JP",
+        clientName: "WEB",
+        clientVersion: "2.20240625.01.00",
+        utcOffsetMinutes: 540
+      }
+    },
+    ...payload
+  };
+
+  try {
+    const fetchOptions = {
+      method: "POST",
+      keepalive: true,
+      headers: headers,
+      body: JSON.stringify(body)
+    };
+    if (customSignal) fetchOptions.signal = customSignal;
+
+    const res = await fetch(url, fetchOptions);
+
+    if ((res.status === 403 || res.status === 429) && retryCount < 2) {
+      await new Promise(r => setTimeout(r, 60));
+      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal);
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`YouTube API Error [${endpoint}]: HTTP ${res.status} - ${errText.slice(0, 100)}`);
+    }
+
+    return await res.json();
+
+  } catch (err) {
+    if (retryCount < 1 && !customSignal?.aborted) {
+      await new Promise(r => setTimeout(r, 60));
+      return await callInnerTube(endpoint, payload, retryCount + 1, customSignal);
+    }
+    throw err;
   }
-  return await res.json();
 }
 
+// チャンネルID解決エンジン (完全キャッシュ化)
 async function resolveChannelId(input) {
   if (!input) return "";
   const clean = input.trim();
   if (clean.startsWith("UC") && clean.length === 24) return clean;
 
   const handle = clean.startsWith("@") ? clean : "@" + clean;
-  if (CHANNEL_ID_CACHE.has(handle)) return CHANNEL_ID_CACHE.get(handle);
+  if (CHANNEL_ID_CACHE.has(handle)) {
+    return CHANNEL_ID_CACHE.get(handle);
+  }
 
   try {
     const res = await callInnerTube("navigation/resolve_url", { url: `https://www.youtube.com/${handle}` });
@@ -225,64 +320,88 @@ async function resolveChannelId(input) {
   return clean;
 }
 
-// ★【動画プレイヤー設定エラー完全撲滅】最も安全で標準的な埋め込みURL
-function makeVideoEmbedUrl(videoId) {
-  return `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=1&playsinline=1&rel=0`;
+// 全部 nocookie URL
+function makeNocookieEmbedUrl(videoId) {
+  return `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1`;
+}
+
+function makeShortNocookieEmbedUrl(videoId) {
+  return `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=1&controls=0&loop=1&playlist=${videoId}&playsinline=1&enablejsapi=1&rel=0`;
 }
 
 // =======================================================
-// ★ 1. 検索 (追加読み込み [] 解決版)
+// ★ 1. 検索エンジン (追加読み込み爆速化 ＆ 重複ゼロ)
 // =======================================================
 async function fetchFastSearch(query, limit = 30, continuationToken = null) {
-  const payload = continuationToken ? { continuation: continuationToken } : { query: query };
+  const payload = continuationToken
+    ? { continuation: continuationToken }
+    : { query: query };
+
   const data = await callInnerTube("search", payload);
   const results = [];
   const seenIds = new Set();
   let nextContinuation = null;
 
+  // 追加読み込み時
   if (continuationToken) {
-    const actions = data.onResponseReceivedActions || data.onResponseReceivedCommands || [];
-    for (let a = 0; a < actions.length; a++) {
-      const items = actions[a].appendContinuationItemsAction?.continuationItems ||
-                    actions[a].reloadContinuationItemsCommand?.continuationItems;
-      if (Array.isArray(items)) {
-        for (let i = 0; i < items.length; i++) {
-          const item = items[i];
-          if (item.continuationItemRenderer) {
-            nextContinuation = item.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || null;
-            continue;
-          }
-          const subItems = item.itemSectionRenderer?.contents || [item];
-          for (let j = 0; j < subItems.length; j++) {
-            const sub = subItems[j];
-            if (sub.continuationItemRenderer) {
-              nextContinuation = sub.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || nextContinuation;
-              continue;
-            }
-            const v = extractVideoRenderer(sub);
-            if (v && v.videoId && !seenIds.has(v.videoId)) {
-              seenIds.add(v.videoId);
-              results.push(v);
-              if (results.length >= limit) break;
+    const actions = data.onResponseReceivedActions || data.onResponseReceivedCommands;
+    if (Array.isArray(actions)) {
+      for (let a = 0; a < actions.length; a++) {
+        const rawItems = actions[a].appendContinuationItemsAction?.continuationItems ||
+                         actions[a].reloadContinuationItemsCommand?.continuationItems;
+        if (Array.isArray(rawItems)) {
+          // 最末尾から本物次ページトークン取得
+          for (let i = rawItems.length - 1; i >= 0; i--) {
+            if (rawItems[i].continuationItemRenderer) {
+              nextContinuation = rawItems[i].continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || null;
+              break;
             }
           }
-          if (results.length >= limit) break;
-        }
-        if (results.length > 0 || nextContinuation) {
-          return { results, continuation: nextContinuation };
+
+          for (let i = 0; i < rawItems.length; i++) {
+            const it = rawItems[i];
+            if (it.continuationItemRenderer) continue;
+
+            if (it.itemSectionRenderer?.contents) {
+              const subItems = it.itemSectionRenderer.contents;
+              for (let j = 0; j < subItems.length; j++) {
+                const sub = subItems[j];
+                if (sub.continuationItemRenderer) continue;
+                const v = extractVideoRenderer(sub);
+                if (v && v.videoId && !seenIds.has(v.videoId)) {
+                  seenIds.add(v.videoId);
+                  results.push(v);
+                }
+              }
+            } else {
+              const v = extractVideoRenderer(it);
+              if (v && v.videoId && !seenIds.has(v.videoId)) {
+                seenIds.add(v.videoId);
+                results.push(v);
+              }
+            }
+            if (results.length >= limit) break;
+          }
+          if (results.length > 0) {
+            return { results, continuation: nextContinuation };
+          }
         }
       }
     }
   }
 
+  // 初回検索時
   const sections = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents;
   if (Array.isArray(sections)) {
-    for (let s = 0; s < sections.length; s++) {
-      const sec = sections[s];
-      if (sec.continuationItemRenderer) {
-        nextContinuation = sec.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token;
+    for (let s = sections.length - 1; s >= 0; s--) {
+      if (sections[s].continuationItemRenderer) {
+        nextContinuation = sections[s].continuationItemRenderer.continuationEndpoint?.continuationCommand?.token;
+        break;
       }
-      const items = sec.itemSectionRenderer?.contents;
+    }
+
+    for (let s = 0; s < sections.length; s++) {
+      const items = sections[s].itemSectionRenderer?.contents;
       if (Array.isArray(items)) {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
@@ -292,46 +411,219 @@ async function fetchFastSearch(query, limit = 30, continuationToken = null) {
             results.push(v);
             if (results.length >= limit) break;
           }
+          if (item.playlistRenderer && !seenIds.has(item.playlistRenderer.playlistId)) {
+            const pr = item.playlistRenderer;
+            seenIds.add(pr.playlistId);
+            const thumbs = pr.thumbnails?.[0]?.thumbnails || [];
+            results.push({
+              type: "playlist",
+              title: pr.title?.simpleText || pr.title?.runs?.map(r => r.text).join("") || "Playlist",
+              playlistId: pr.playlistId,
+              author: pr.shortBylineText?.runs?.[0]?.text || "",
+              authorId: pr.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId || "",
+              videoCount: parseCount(pr.videoCount || "0"),
+              thumbnail: fixUrl(thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${pr.navigationEndpoint?.watchEndpoint?.videoId}/hqdefault.jpg`)
+            });
+          }
         }
       }
       if (results.length >= limit) break;
     }
-    if (results.length > 0) {
-      if (!nextContinuation) nextContinuation = extractSearchContinuation(data);
-      return { results, continuation: nextContinuation };
-    }
+    return { results, continuation: nextContinuation };
   }
 
-  function scanSearchFallback(node, depth = 0) {
-    if (!node || typeof node !== "object" || results.length >= limit || depth > 15) return;
-    const v = extractVideoRenderer(node);
-    if (v && v.videoId && !seenIds.has(v.videoId)) {
-      seenIds.add(v.videoId);
-      results.push(v);
-      return;
-    }
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) {
-        if (results.length >= limit) break;
-        scanSearchFallback(node[i], depth + 1);
-      }
-    } else {
-      const keys = Object.keys(node);
-      for (let i = 0; i < keys.length; i++) {
-        if (results.length >= limit) break;
-        if (keys[i] !== "trackingParams" && keys[i] !== "serviceTrackingParams") {
-          scanSearchFallback(node[keys[i]], depth + 1);
-        }
-      }
-    }
-  }
-  scanSearchFallback(data);
-  nextContinuation = extractSearchContinuation(data);
   return { results, continuation: nextContinuation };
 }
 
 // =======================================================
-// ★ 2. チャンネル情報 & 各タブ（本物の人気順/古い順トークン抽出・再生リスト完全対応）
+// ★ 2. 通常動画詳細（目安3秒ガード ＆ コメント・詳細の自動ロード）
+// =======================================================
+async function fetchFastVideoWithDetailsAndComments(videoId, limit = 15, continuationToken = null) {
+  // ★ 目安3秒タイムアウト用の AbortController を設置
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), 3000);
+
+  try {
+    const payload = continuationToken ? { continuation: continuationToken } : { videoId: videoId };
+
+    // 1. 動画情報とおすすめ動画を取得
+    const nextData = await callInnerTube("next", payload, 0, timeoutController.signal);
+
+    let primaryInfo = null;
+    let secondaryInfo = null;
+    const recommendedVideos = [];
+    const seenIds = new Set();
+    const nextContinuation = extractContinuationToken(nextData);
+
+    let firstCommentToken = null;
+
+    function scanWatch(node, depth = 0) {
+      if (!node || typeof node !== "object" || depth > 20) return;
+      if (node.videoPrimaryInfoRenderer) primaryInfo = node.videoPrimaryInfoRenderer;
+      if (node.videoSecondaryInfoRenderer) secondaryInfo = node.videoSecondaryInfoRenderer;
+
+      // コメント初期トークンを検出
+      if (!firstCommentToken && node.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token) {
+        firstCommentToken = node.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+      }
+
+      if (recommendedVideos.length < limit) {
+        const v = extractVideoRenderer(node);
+        if (v && v.videoId && v.videoId !== videoId && !seenIds.has(v.videoId)) {
+          seenIds.add(v.videoId);
+          recommendedVideos.push(v);
+        }
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          if (recommendedVideos.length >= limit && primaryInfo && secondaryInfo && firstCommentToken) break;
+          scanWatch(node[i], depth + 1);
+        }
+      } else {
+        const keys = Object.keys(node);
+        for (let i = 0; i < keys.length; i++) {
+          if (recommendedVideos.length >= limit && primaryInfo && secondaryInfo && firstCommentToken) break;
+          const k = keys[i];
+          if (k !== "trackingParams" && k !== "serviceTrackingParams") scanWatch(node[k], depth + 1);
+        }
+      }
+    }
+    scanWatch(nextData);
+
+    // ★ 動画詳細が取れたら、コメントが未ロードならその場で即座に並行ロード（3秒以内）
+    let initialComments = [];
+    let commentsCount = 0;
+    let commentsNextToken = null;
+
+    if (firstCommentToken && !continuationToken) {
+      try {
+        const commentData = await callInnerTube("next", { continuation: firstCommentToken }, 0, timeoutController.signal);
+        if (commentData) {
+          const parsedComments = parseCommentsFromData(commentData, 30);
+          initialComments = parsedComments.comments;
+          commentsCount = parsedComments.commentCount;
+          commentsNextToken = parsedComments.continuation;
+        }
+      } catch (e) {}
+    }
+
+    const channelOwner = secondaryInfo?.owner?.videoOwnerRenderer;
+    const title = primaryInfo?.title?.runs?.map(r => r.text).join("") || "";
+    const description = secondaryInfo?.attributedDescription?.content || secondaryInfo?.description?.runs?.map(r => r.text).join("") || "";
+
+    return {
+      type: "video",
+      title: title,
+      videoId: videoId,
+      thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      videoThumbnails: makeReliableThumbnails(videoId),
+      description: description,
+      descriptionHtml: escapeHtml(description).replace(/\n/g, "<br>"),
+      publishedText: primaryInfo?.dateText?.simpleText || "",
+      viewCount: parseCount(primaryInfo?.viewCount?.videoViewCountRenderer?.viewCount?.simpleText || ""),
+      author: channelOwner?.title?.runs?.[0]?.text || "",
+      authorId: channelOwner?.navigationEndpoint?.browseEndpoint?.browseId || "",
+      authorUrl: channelOwner?.navigationEndpoint?.browseEndpoint?.browseId ? `/channel/${channelOwner.navigationEndpoint.browseEndpoint.browseId}` : "",
+      authorThumbnails: (channelOwner?.thumbnail?.thumbnails || []).map(t => ({ url: fixUrl(t.url), width: t.width || 48, height: t.height || 48 })),
+      subCountText: channelOwner?.subscriberCountText?.simpleText || "",
+      embedUrl: makeNocookieEmbedUrl(videoId),
+      recommendedVideos: recommendedVideos,
+      // ★ 同時にロードされたコメント一式
+      commentCount: commentsCount,
+      comments: initialComments,
+      commentsContinuation: commentsNextToken,
+      continuation: nextContinuation
+    };
+
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// コメントレスポンス高速パーサー
+function parseCommentsFromData(commentData, limit = 30) {
+  let nextContinuation = null;
+  let commentCount = 0;
+  const comments = [];
+  const seenIds = new Set();
+
+  const actions = commentData.onResponseReceivedEndpoints || commentData.onResponseReceivedActions;
+  if (Array.isArray(actions)) {
+    for (let a = 0; a < actions.length; a++) {
+      const items = actions[a].appendContinuationItemsAction?.continuationItems ||
+                    actions[a].reloadContinuationItemsCommand?.continuationItems;
+      if (Array.isArray(items)) {
+        for (let i = items.length - 1; i >= 0; i--) {
+          if (items[i].continuationItemRenderer) {
+            nextContinuation = items[i].continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || null;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const mutationsMap = new Map();
+  if (commentData.frameworkUpdates?.entityBatchUpdate?.mutations) {
+    for (const m of commentData.frameworkUpdates.entityBatchUpdate.mutations) {
+      if (m.payload?.commentEntityPayload) mutationsMap.set(m.entityKey, m.payload.commentEntityPayload);
+    }
+  }
+
+  function scanComments(node, depth = 0) {
+    if (!node || typeof node !== "object" || comments.length >= limit || depth > 18) return;
+    if (node.commentsHeaderRenderer) {
+      const txt = node.commentsHeaderRenderer.countText?.runs?.map(r => r.text).join("") || "";
+      const num = parseInt(txt.replace(/[^0-9]/g, ""), 10);
+      if (!isNaN(num)) commentCount = num;
+    }
+    if (node.commentViewModel) {
+      const cvm = node.commentViewModel.commentViewModel || node.commentViewModel;
+      const commentId = cvm.commentId || cvm.commentKey;
+      if (commentId && !seenIds.has(commentId)) {
+        let payload = null;
+        for (const [k, p] of mutationsMap.entries()) {
+          if (k.includes(commentId) || (cvm.commentKey && k === cvm.commentKey)) { payload = p; break; }
+        }
+        const content = payload?.properties?.content?.content || cvm.contentText?.content || cvm.contentText?.runs?.map(r => r.text).join("") || "";
+        const author = payload?.author?.displayName || cvm.authorText?.content || "";
+        let avatarUrl = payload?.author?.avatarThumbnailUrl || "";
+        if (!avatarUrl) {
+          const thumbs = cvm.authorThumbnail?.image?.sources || cvm.authorThumbnail?.thumbnails || [];
+          if (thumbs.length > 0) avatarUrl = thumbs[thumbs.length - 1].url;
+        }
+        const authorId = payload?.author?.channelId || cvm.authorEndpoint?.browseEndpoint?.browseId || "";
+        const publishedText = payload?.properties?.publishedTime || cvm.publishedTime || "";
+        const likeStr = payload?.toolbar?.likeCountNotSelected || cvm.toolbar?.commentToolbarViewModel?.likeCountNotSelectedText || "0";
+        if (content || author) {
+          seenIds.add(commentId);
+          comments.push({
+            author, authorUrl: authorId ? `/channel/${authorId}` : "", authorId,
+            authorThumbnails: avatarUrl ? [{ url: fixUrl(avatarUrl), width: 48, height: 48 }] : [],
+            commentId, authorIsChannelOwner: !!cvm.authorIsChannelOwner,
+            content, contentHtml: escapeHtml(content).replace(/\n/g, "<br>"),
+            published: 0, publishedText, likeCount: parseCount(likeStr),
+            replyCount: cvm.replyCount || 0, isPinned: !!cvm.pinnedCommentBadge
+          });
+        }
+      }
+    }
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) scanComments(node[i], depth + 1);
+    } else {
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i] !== "trackingParams") scanComments(node[keys[i]], depth + 1);
+      }
+    }
+  }
+  scanComments(commentData);
+
+  return { commentCount: commentCount || comments.length, comments, continuation: nextContinuation };
+}
+
+// =======================================================
+// ★ 3. チャンネル情報 & 各タブ (人気順・古い順対応 ＆ 再生リスト分離)
 // =======================================================
 async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "latest", limit = 30, continuationToken = null) {
   let browseData = null;
@@ -341,56 +633,44 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
     browseData = await callInnerTube("browse", { continuation: continuationToken });
   } else {
     channelId = await resolveChannelId(channelInput);
-
-    // ★ 再生リストタブの場合は、タブ構造を正確に開く
+    
     let tabParam = null;
-    if (tab === "videos") tabParam = "EgZ2aWRlb3PyBgQKAjoA";
+    if (tab === "videos") tabParam = "Egl2aWRlb3PyBgQKAjoA";
     else if (tab === "shorts") tabParam = "EgZzaG9ydHPyBgQKAjoA";
     else if (tab === "playlists") tabParam = "EglwbGF5bGlzdHPyBgQKAjoA";
 
     const payload = { browseId: channelId };
     if (tabParam) payload.params = tabParam;
 
-    try {
-      browseData = await callInnerTube("browse", payload);
-    } catch (err) {
-      browseData = await callInnerTube("browse", { browseId: channelId });
-    }
+    browseData = await callInnerTube("browse", payload);
 
-    // ★【人気順・古い順の完全解決】
-    // feedFilterChipBarRenderer のチップから公式の continuation トークンを引き抜く！
+    // 人気順・古い順のチップ自動解決
     if (tab === "videos" && (sort === "popular" || sort === "oldest") && browseData) {
       let sortToken = null;
       function findSortChip(node, depth = 0) {
         if (!node || typeof node !== "object" || sortToken || depth > 15) return;
-        if (node.feedFilterChipBarRenderer?.contents) {
-          const chips = node.feedFilterChipBarRenderer.contents;
-          for (let i = 0; i < chips.length; i++) {
-            const chip = chips[i].chipCloudChipRenderer;
-            if (!chip) continue;
-            const title = chip.text?.runs?.[0]?.text || chip.text?.simpleText || "";
-            const isMatch = (sort === "popular" && (title.includes("人気") || title.toLowerCase().includes("popular") || i === 1)) ||
-                            (sort === "oldest" && (title.includes("古い") || title.toLowerCase().includes("oldest") || i === 2));
-            if (isMatch) {
-              sortToken = chip.navigationEndpoint?.continuationEndpoint?.continuationCommand?.token ||
-                          chip.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url || null;
-              if (sortToken) return;
-            }
+        if (node.chipCloudChipRenderer) {
+          const chip = node.chipCloudChipRenderer;
+          const text = chip.text?.runs?.map(r => r.text).join("") || chip.text?.simpleText || "";
+          const targetText = sort === "popular" ? "人気" : "古い順";
+          if (text.includes(targetText)) {
+            sortToken = chip.navigationEndpoint?.continuationEndpoint?.continuationCommand?.token || null;
+            return;
           }
         }
         if (Array.isArray(node)) {
           for (let i = 0; i < node.length; i++) { if (sortToken) break; findSortChip(node[i], depth + 1); }
         } else {
           const keys = Object.keys(node);
-          for (let i = 0; i < keys.length; i++) { if (sortToken) break; if (keys[i] !== "trackingParams") findSortChip(node[keys[i]], depth + 1); }
+          for (let i = 0; i < keys.length; i++) { if (sortToken) break; findSortChip(node[keys[i]], depth + 1); }
         }
       }
       findSortChip(browseData);
-
+      
       if (sortToken) {
         try {
-          const sortedData = await callInnerTube("browse", { continuation: sortToken });
-          if (sortedData) browseData = sortedData;
+          const sortedBrowseData = await callInnerTube("browse", { continuation: sortToken });
+          if (sortedBrowseData) browseData = sortedBrowseData;
         } catch (e) {}
       }
     }
@@ -404,46 +684,58 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
 
   // 追加読み込み時
   if (continuationToken) {
-    const actions = browseData.onResponseReceivedActions || browseData.onResponseReceivedCommands || [];
-    for (let a = 0; a < actions.length; a++) {
-      const rawItems = actions[a].appendContinuationItemsAction?.continuationItems ||
-                       actions[a].reloadContinuationItemsCommand?.continuationItems;
-      if (Array.isArray(rawItems)) {
-        for (let i = 0; i < rawItems.length; i++) {
-          const it = rawItems[i];
-          if (it.continuationItemRenderer) {
-            nextContinuation = it.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || null;
-            continue;
+    const actions = browseData.onResponseReceivedActions || browseData.onResponseReceivedCommands;
+    if (Array.isArray(actions)) {
+      for (let a = 0; a < actions.length; a++) {
+        const rawItems = actions[a].appendContinuationItemsAction?.continuationItems ||
+                         actions[a].reloadContinuationItemsCommand?.continuationItems;
+        if (Array.isArray(rawItems)) {
+          for (let i = rawItems.length - 1; i >= 0; i--) {
+            if (rawItems[i].continuationItemRenderer) {
+              nextContinuation = rawItems[i].continuationItemRenderer.continuationEndpoint?.continuationCommand?.token || null;
+              break;
+            }
           }
-          if (tab === "playlists") {
-            const pr = it.gridPlaylistRenderer || it.playlistRenderer || it.lockupViewModel;
-            if (pr) {
-              const plId = pr.playlistId || pr.contentId;
-              if (plId && !seenIds.has(plId)) {
-                seenIds.add(plId);
-                items.push({
-                  type: "playlist",
-                  title: pr.title?.runs?.map(r => r.text).join("") || pr.title?.simpleText || pr.metadata?.lockupMetadataViewModel?.title?.content || "Playlist",
-                  playlistId: plId,
-                  videoCount: parseCount(pr.videoCountShortText?.simpleText || pr.videoCountText?.runs?.[0]?.text || pr.videoCount || "0"),
-                  thumbnail: fixUrl(pr.thumbnail?.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${plId}/hqdefault.jpg`)
-                });
+
+          for (let i = 0; i < rawItems.length; i++) {
+            const it = rawItems[i];
+            if (it.continuationItemRenderer) continue;
+
+            if (tab === "playlists") {
+              const pr = it.gridPlaylistRenderer || it.playlistRenderer || it.lockupViewModel;
+              if (pr) {
+                const plId = pr.playlistId || pr.contentId;
+                if (plId && !seenIds.has(plId)) {
+                  seenIds.add(plId);
+                  items.push({
+                    type: "playlist",
+                    title: pr.title?.runs?.map(r => r.text).join("") || pr.title?.simpleText || pr.metadata?.lockupMetadataViewModel?.title?.content || "Playlist",
+                    playlistId: plId,
+                    videoCount: parseCount(pr.videoCount || "0"),
+                    thumbnail: fixUrl(pr.thumbnail?.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${plId}/hqdefault.jpg`)
+                  });
+                }
+              }
+            } else {
+              const v = extractVideoRenderer(it);
+              if (v && v.videoId && !seenIds.has(v.videoId)) {
+                if (tab === "shorts") v.isShort = true;
+                seenIds.add(v.videoId);
+                items.push(v);
               }
             }
-          } else {
-            const v = extractVideoRenderer(it);
-            if (v && v.videoId && !seenIds.has(v.videoId)) {
-              if (tab === "shorts") v.isShort = true;
-              seenIds.add(v.videoId);
-              items.push(v);
-            }
+            if (items.length >= limit) break;
           }
-          if (items.length >= limit) break;
+          return {
+            author: "",
+            authorId: channelId,
+            currentTab: tab,
+            currentSort: sort,
+            contents: items,
+            latestVideos: items,
+            continuation: nextContinuation
+          };
         }
-        return {
-          author: "", authorId: channelId, currentTab: tab, currentSort: sort,
-          contents: items, latestVideos: items, continuation: nextContinuation
-        };
       }
     }
   }
@@ -486,8 +778,8 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
     if (!author) author = browseData.metadata?.channelMetadataRenderer?.title || channelId;
   }
 
-  // ★ 再生リスト専用：動画を100%除外し、本物の再生リストのみ抽出
-  function scanChannelContentsFast(node, depth = 0) {
+  // 初回タブ読み込み（再生リストと動画の完全分離）
+  function scanChannelContents(node, depth = 0) {
     if (!node || typeof node !== "object" || items.length >= limit || depth > 20) return;
 
     if (tab === "playlists") {
@@ -548,7 +840,7 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
         v.author = author || v.author;
         v.authorId = channelId;
         v.authorUrl = `/channel/${channelId}`;
-        v.embedUrl = makeVideoEmbedUrl(v.videoId);
+        v.embedUrl = v.isShort ? makeShortNocookieEmbedUrl(v.videoId) : makeNocookieEmbedUrl(v.videoId);
         items.push(v);
       }
     }
@@ -556,7 +848,7 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
     if (Array.isArray(node)) {
       for (let i = 0; i < node.length; i++) {
         if (items.length >= limit) break;
-        scanChannelContentsFast(node[i], depth + 1);
+        scanChannelContents(node[i], depth + 1);
       }
     } else {
       const keys = Object.keys(node);
@@ -564,28 +856,37 @@ async function fetchInvidiousChannel(channelInput, tab = "videos", sort = "lates
         if (items.length >= limit) break;
         const k = keys[i];
         if (k !== "trackingParams" && k !== "serviceTrackingParams") {
-          scanChannelContentsFast(node[k], depth + 1);
+          scanChannelContents(node[k], depth + 1);
         }
       }
     }
   }
 
-  scanChannelContentsFast(browseData);
+  scanChannelContents(browseData);
 
   return {
-    author, authorId: channelId, authorUrl: `/channel/${channelId}`,
-    authorThumbnails, authorBanners, subCount: parseCount(subCountText),
-    totalViews: 0, joined: 0, description,
+    author: author,
+    authorId: channelId,
+    authorUrl: `/channel/${channelId}`,
+    authorThumbnails: authorThumbnails,
+    authorBanners: authorBanners,
+    subCount: parseCount(subCountText),
+    totalViews: 0,
+    joined: 0,
+    description: description,
     descriptionHtml: escapeHtml(description).replace(/\n/g, "<br>"),
-    currentTab: tab, currentSort: sort,
+    currentTab: tab,
+    currentSort: sort,
     tabs: ["home", "videos", "shorts", "playlists"],
-    availableSorts: tab === "videos" ? ["latest", "popular", "oldest"] : [],
-    contents: items, latestVideos: items, continuation: nextContinuation
+    availableSorts: tab === "videos" ? ["latest", "popular", "oldest"] : (tab === "shorts" ? ["latest", "popular"] : []),
+    contents: items,
+    latestVideos: items,
+    continuation: nextContinuation
   };
 }
 
 // =======================================================
-// ★ 3. ショート動画
+// ★ 4. ショート動画エンジン (全部 nocookie ＆ 自動再生)
 // =======================================================
 async function getInitialShortIdFast() {
   return "9f1rHt0W_Ak";
@@ -646,7 +947,7 @@ async function fetchFastShortWith3Next(videoId) {
           title: v.title,
           author: v.author || "YouTube Creator",
           thumbnail: v.thumbnail || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          embedUrl: makeVideoEmbedUrl(v.videoId)
+          embedUrl: makeShortNocookieEmbedUrl(v.videoId)
         });
       }
     }
@@ -680,7 +981,7 @@ async function fetchFastShortWith3Next(videoId) {
       authorThumbnails: authorThumbnails.length > 0 ? authorThumbnails : [{ url: "https://www.gstatic.com/youtube/img/creator/avatar/creator_avatar_default.png", width: 48, height: 48 }],
       likeCount: likeCount,
       commentCount: "コメント",
-      embedUrl: makeVideoEmbedUrl(videoId),
+      embedUrl: makeShortNocookieEmbedUrl(videoId),
       videoThumbnails: makeReliableThumbnails(videoId)
     },
     sequence: next3Videos
@@ -688,7 +989,46 @@ async function fetchFastShortWith3Next(videoId) {
 }
 
 // =======================================================
-// ★ 4. 画像灰色撲滅 ＆ 高精度カードパーサー
+// ★ 5. コメント単体取得
+// =======================================================
+async function fetchInvidiousComments(videoId, limit = 50, continuationToken = null) {
+  let commentToken = continuationToken;
+  
+  if (!commentToken) {
+    const nextData = await callInnerTube("next", { videoId });
+    const mainContents = nextData.contents?.twoColumnWatchNextResults?.results?.results?.contents;
+    function findFirstCommentToken(node, depth = 0) {
+      if (!node || typeof node !== "object" || commentToken || depth > 15) return;
+      if (node.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token) {
+        commentToken = node.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+        return;
+      }
+      if (node.continuationCommand?.token) {
+        commentToken = node.continuationCommand.token;
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) findFirstCommentToken(node[i], depth + 1);
+      } else {
+        const keys = Object.keys(node);
+        for (let i = 0; i < keys.length; i++) {
+          if (keys[i] !== "trackingParams") findFirstCommentToken(node[keys[i]], depth + 1);
+        }
+      }
+    }
+    findFirstCommentToken(mainContents);
+    if (!commentToken) findFirstCommentToken(nextData);
+  }
+
+  if (!commentToken) return { commentCount: 0, videoId, comments: [], continuation: null };
+
+  const commentData = await callInnerTube("next", { continuation: commentToken });
+  const parsed = parseCommentsFromData(commentData, limit);
+  return { commentCount: parsed.commentCount, videoId, comments: parsed.comments, continuation: parsed.continuation };
+}
+
+// =======================================================
+// ★ 6. 動画パーサー (全部 nocookie ＆ 画像灰色撲滅)
 // =======================================================
 function extractVideoRenderer(rawNode) {
   if (!rawNode || typeof rawNode !== "object") return null;
@@ -728,7 +1068,7 @@ function extractVideoRenderer(rawNode) {
       viewCountText: vr.viewCountText?.simpleText || vr.viewCountText?.runs?.map(r => r.text).join("") || "",
       viewCount: parseCount(vr.viewCountText?.simpleText || ""),
       publishedText: vr.publishedTimeText?.simpleText || vr.publishedTimeText?.runs?.[0]?.text || "",
-      embedUrl: makeVideoEmbedUrl(videoId)
+      embedUrl: isShort ? makeShortNocookieEmbedUrl(videoId) : makeNocookieEmbedUrl(videoId)
     };
   }
 
@@ -769,7 +1109,7 @@ function extractVideoRenderer(rawNode) {
         viewCountText: viewTextStr,
         viewCount: parseCount(viewTextStr),
         publishedText: publishedTextStr,
-        embedUrl: makeVideoEmbedUrl(videoId)
+        embedUrl: isShort ? makeShortNocookieEmbedUrl(videoId) : makeNocookieEmbedUrl(videoId)
       };
     }
   }
@@ -793,7 +1133,7 @@ function extractVideoRenderer(rawNode) {
         viewCountText: r.viewCountText?.simpleText || "",
         viewCount: parseCount(r.viewCountText?.simpleText || ""),
         publishedText: "",
-        embedUrl: makeVideoEmbedUrl(vId)
+        embedUrl: makeShortNocookieEmbedUrl(vId)
       };
     }
   }
@@ -810,180 +1150,8 @@ function makeReliableThumbnails(videoId) {
 }
 
 // =======================================================
-// ★ 5. コメント取得（同じコメントが重複して出るバグを完全解消）
+// ★ 7. プレイリスト単体 ＆ トレンド
 // =======================================================
-async function fetchInvidiousComments(videoId, limit = 50, continuationToken = null) {
-  let commentToken = continuationToken;
-  if (!commentToken) {
-    const nextData = await callInnerTube("next", { videoId });
-    const mainContents = nextData.contents?.twoColumnWatchNextResults?.results?.results?.contents;
-    function scanToken(node, depth = 0) {
-      if (!node || typeof node !== "object" || commentToken || depth > 12) return;
-      if (node.continuationCommand?.token) { commentToken = node.continuationCommand.token; return; }
-      if (Array.isArray(node)) {
-        for (let i = 0; i < node.length; i++) scanToken(node[i], depth + 1);
-      } else {
-        const keys = Object.keys(node);
-        for (let i = 0; i < keys.length; i++) {
-          if (keys[i] !== "trackingParams") scanToken(node[keys[i]], depth + 1);
-        }
-      }
-    }
-    scanToken(mainContents);
-    if (!commentToken) scanToken(nextData);
-  }
-  if (!commentToken) return { commentCount: 0, videoId, comments: [], continuation: null };
-
-  const commentData = await callInnerTube("next", { continuation: commentToken });
-  
-  // ★【重要：重複解消】上部のソートメニューを無視し、コメントリスト末尾の本物の次トークンだけを取得！
-  const nextContinuation = extractCommentNextToken(commentData);
-
-  let commentCount = 0;
-  const comments = [];
-  const seenIds = new Set();
-  const mutationsMap = new Map();
-  if (commentData.frameworkUpdates?.entityBatchUpdate?.mutations) {
-    for (const m of commentData.frameworkUpdates.entityBatchUpdate.mutations) {
-      if (m.payload?.commentEntityPayload) mutationsMap.set(m.entityKey, m.payload.commentEntityPayload);
-    }
-  }
-
-  function scanComments(node, depth = 0) {
-    if (!node || typeof node !== "object" || comments.length >= limit || depth > 18) return;
-    if (node.commentsHeaderRenderer) {
-      const txt = node.commentsHeaderRenderer.countText?.runs?.map(r => r.text).join("") || "";
-      const num = parseInt(txt.replace(/[^0-9]/g, ""), 10);
-      if (!isNaN(num)) commentCount = num;
-    }
-    if (node.commentViewModel) {
-      const cvm = node.commentViewModel.commentViewModel || node.commentViewModel;
-      const commentId = cvm.commentId || cvm.commentKey;
-      if (commentId && !seenIds.has(commentId)) {
-        let payload = null;
-        for (const [k, p] of mutationsMap.entries()) {
-          if (k.includes(commentId) || (cvm.commentKey && k === cvm.commentKey)) { payload = p; break; }
-        }
-        const content = payload?.properties?.content?.content || cvm.contentText?.content || cvm.contentText?.runs?.map(r => r.text).join("") || "";
-        const author = payload?.author?.displayName || cvm.authorText?.content || "";
-        let avatarUrl = payload?.author?.avatarThumbnailUrl || "";
-        if (!avatarUrl) {
-          const thumbs = cvm.authorThumbnail?.image?.sources || cvm.authorThumbnail?.thumbnails || [];
-          if (thumbs.length > 0) avatarUrl = thumbs[thumbs.length - 1].url;
-        }
-        const authorId = payload?.author?.channelId || cvm.authorEndpoint?.browseEndpoint?.browseId || "";
-        const publishedText = payload?.properties?.publishedTime || cvm.publishedTime || "";
-        const likeStr = payload?.toolbar?.likeCountNotSelected || cvm.toolbar?.commentToolbarViewModel?.likeCountNotSelectedText || "0";
-        if (content || author) {
-          seenIds.add(commentId);
-          comments.push({
-            author, authorUrl: authorId ? `/channel/${authorId}` : "", authorId,
-            authorThumbnails: avatarUrl ? [{ url: fixUrl(avatarUrl), width: 48, height: 48 }] : [],
-            commentId, authorIsChannelOwner: !!cvm.authorIsChannelOwner,
-            content, contentHtml: escapeHtml(content).replace(/\n/g, "<br>"),
-            published: 0, publishedText, likeCount: parseCount(likeStr),
-            replyCount: cvm.replyCount || 0, isPinned: !!cvm.pinnedCommentBadge
-          });
-        }
-      }
-    }
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) scanComments(node[i], depth + 1);
-    } else {
-      const keys = Object.keys(node);
-      for (let i = 0; i < keys.length; i++) {
-        if (keys[i] !== "trackingParams") scanComments(node[keys[i]], depth + 1);
-      }
-    }
-  }
-  scanComments(commentData);
-  return { commentCount: commentCount || comments.length, videoId, comments, continuation: nextContinuation };
-}
-
-// ★【本物トークン抽出】コメント専用
-function extractCommentNextToken(data) {
-  const actions = data.onResponseReceivedEndpoints || data.onResponseReceivedActions || data.onResponseReceivedCommands || [];
-  for (let i = 0; i < actions.length; i++) {
-    const act = actions[i];
-    const items = act.appendContinuationItemsAction?.continuationItems ||
-                  act.reloadContinuationItemsCommand?.continuationItems;
-    if (Array.isArray(items)) {
-      for (let j = items.length - 1; j >= 0; j--) {
-        const it = items[j];
-        if (it.continuationItemRenderer) {
-          const t = it.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token ||
-                    it.continuationItemRenderer.button?.buttonRenderer?.command?.continuationEndpoint?.continuationCommand?.token;
-          if (t) return t;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-// =======================================================
-// ★ 6. 通常動画・プレイリスト単体・トレンド
-// =======================================================
-async function fetchFastVideo(videoId, limit = 15, continuationToken = null) {
-  const payload = continuationToken ? { continuation: continuationToken } : { videoId: videoId };
-  const nextData = await callInnerTube("next", payload);
-
-  let primaryInfo = null;
-  let secondaryInfo = null;
-  const recommendedVideos = [];
-  const seenIds = new Set();
-  const nextContinuation = extractContinuationToken(nextData);
-
-  function scanWatch(node, depth = 0) {
-    if (!node || typeof node !== "object" || depth > 20) return;
-    if (node.videoPrimaryInfoRenderer) primaryInfo = node.videoPrimaryInfoRenderer;
-    if (node.videoSecondaryInfoRenderer) secondaryInfo = node.videoSecondaryInfoRenderer;
-
-    if (recommendedVideos.length < limit) {
-      const v = extractVideoRenderer(node);
-      if (v && v.videoId && v.videoId !== videoId && !seenIds.has(v.videoId)) {
-        seenIds.add(v.videoId);
-        recommendedVideos.push(v);
-      }
-    }
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) {
-        if (recommendedVideos.length >= limit && primaryInfo && secondaryInfo) break;
-        scanWatch(node[i], depth + 1);
-      }
-    } else {
-      const keys = Object.keys(node);
-      for (let i = 0; i < keys.length; i++) {
-        if (recommendedVideos.length >= limit && primaryInfo && secondaryInfo) break;
-        const k = keys[i];
-        if (k !== "trackingParams" && k !== "serviceTrackingParams") scanWatch(node[k], depth + 1);
-      }
-    }
-  }
-  scanWatch(nextData);
-
-  const channelOwner = secondaryInfo?.owner?.videoOwnerRenderer;
-  return {
-    type: "video",
-    title: primaryInfo?.title?.runs?.map(r => r.text).join("") || "",
-    videoId: videoId,
-    thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    videoThumbnails: makeReliableThumbnails(videoId),
-    description: secondaryInfo?.attributedDescription?.content || secondaryInfo?.description?.runs?.map(r => r.text).join("") || "",
-    descriptionHtml: escapeHtml(secondaryInfo?.attributedDescription?.content || "").replace(/\n/g, "<br>"),
-    publishedText: primaryInfo?.dateText?.simpleText || "",
-    viewCount: parseCount(primaryInfo?.viewCount?.videoViewCountRenderer?.viewCount?.simpleText || ""),
-    author: channelOwner?.title?.runs?.[0]?.text || "",
-    authorId: channelOwner?.navigationEndpoint?.browseEndpoint?.browseId || "",
-    authorUrl: channelOwner?.navigationEndpoint?.browseEndpoint?.browseId ? `/channel/${channelOwner.navigationEndpoint.browseEndpoint.browseId}` : "",
-    authorThumbnails: (channelOwner?.thumbnail?.thumbnails || []).map(t => ({ url: fixUrl(t.url), width: t.width || 48, height: t.height || 48 })),
-    subCountText: channelOwner?.subscriberCountText?.simpleText || "",
-    embedUrl: makeVideoEmbedUrl(videoId),
-    recommendedVideos: recommendedVideos,
-    continuation: nextContinuation
-  };
-}
-
 async function fetchTrendingVideosReliable(type = "default") {
   const results = [];
   const seenIds = new Set();
@@ -1005,7 +1173,8 @@ async function fetchTrendingVideosReliable(type = "default") {
       } else {
         const keys = Object.keys(node);
         for (let i = 0; i < keys.length; i++) {
-          if (keys[i] !== "trackingParams" && keys[i] !== "serviceTrackingParams") scanTrend(node[keys[i]], depth + 1);
+          const k = keys[i];
+          if (k !== "trackingParams" && k !== "serviceTrackingParams") scanTrend(node[k], depth + 1);
         }
       }
     }
@@ -1053,7 +1222,8 @@ async function fetchInvidiousPlaylist(playlistInput, limit = 50) {
     } else {
       const keys = Object.keys(node);
       for (let i = 0; i < keys.length; i++) {
-        if (keys[i] !== "trackingParams") scanPlVideos(node[keys[i]], depth + 1);
+        const k = keys[i];
+        if (k !== "trackingParams") scanPlVideos(node[k], depth + 1);
       }
     }
   }
@@ -1062,27 +1232,9 @@ async function fetchInvidiousPlaylist(playlistInput, limit = 50) {
   return { title, playlistId: cleanId, author, authorId, authorUrl: `/channel/${authorId}`, videos };
 }
 
-function extractSearchContinuation(data) {
-  const actions = data.onResponseReceivedCommands || data.onResponseReceivedActions;
-  if (actions) {
-    for (let a = 0; a < actions.length; a++) {
-      const items = actions[a].appendContinuationItemsAction?.continuationItems || [];
-      for (let i = items.length - 1; i >= 0; i--) {
-        const t = items[i].continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-        if (t) return t;
-      }
-    }
-  }
-  const secList = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents;
-  if (Array.isArray(secList)) {
-    for (let i = secList.length - 1; i >= 0; i--) {
-      const t = secList[i].continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-      if (t) return t;
-    }
-  }
-  return null;
-}
-
+// =======================================================
+// チャンネル＆汎用トークン抽出
+// =======================================================
 function extractChannelContinuation(data) {
   const actions = data.onResponseReceivedActions || data.onResponseReceivedCommands;
   if (actions) {
@@ -1182,16 +1334,15 @@ function fixUrl(url) {
 }
 
 // =======================================================
-// デモ UI (全バグ完全修正)
+// デモ UI
 // =======================================================
 function renderDemoHtml(origin) {
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>Invidious Ultra Turbo Engine v16</title>
-  <!-- ★ 動画プレイヤー設定エラー防止のため strict-origin-when-cross-origin に変更 -->
-  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Invidious Ultra Turbo Engine v18</title>
+  <meta name="referrer" content="no-referrer">
   <style>
     body { font-family: sans-serif; background: #0f0f0f; color: #fff; padding: 20px; max-width: 980px; margin: 0 auto; }
     h1 { font-size: 20px; color: #00e5ff; }
@@ -1213,14 +1364,13 @@ function renderDemoHtml(origin) {
   </style>
 </head>
 <body>
-  <h1>Invidious Ultra Turbo Engine v16 (全不具合完全修復版)</h1>
-  
+  <h1>Invidious Ultra Turbo Engine v18 (検索追加0ms ＆ 動画・コメント同時ロード)</h1>
   <div class="tabs">
-    <button class="tab-btn active" onclick="setMode('search')">🔍 検索 (追加読込修復)</button>
+    <button class="tab-btn active" onclick="setMode('search')">🔍 検索 (無限連鎖0ms)</button>
     <button class="tab-btn" onclick="setMode('channel')">📺 チャンネル (@HikakinTV)</button>
-    <button class="tab-btn" onclick="setMode('shorts')">📱 ショート (自動再生)</button>
-    <button class="tab-btn" onclick="setMode('video')">🎬 通常動画詳細</button>
-    <button class="tab-btn" onclick="setMode('comments')">💬 コメント一覧</button>
+    <button class="tab-btn" onclick="setMode('shorts')">📱 ショート (全部nocookie)</button>
+    <button class="tab-btn" onclick="setMode('video')">🎬 通常動画詳細 (コメント自動同梱・目安3秒)</button>
+    <button class="tab-btn" onclick="setMode('comments')">💬 コメント単体</button>
     <button class="tab-btn" onclick="setMode('playlist')">📑 プレイリスト詳細</button>
     <button class="tab-btn" onclick="setMode('trending')">🔥 トレンド</button>
   </div>
@@ -1248,7 +1398,7 @@ function renderDemoHtml(origin) {
     <div class="shorts-columns">
       <div class="shorts-current-box">
         <div class="shorts-current">
-          <iframe id="shortsIframe" src="" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen playsinline referrerpolicy="strict-origin-when-cross-origin"></iframe>
+          <iframe id="shortsIframe" src="" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
         </div>
         <div style="margin-top:8px;">
           <b id="shortTitleDisplay"></b>
@@ -1269,12 +1419,6 @@ function renderDemoHtml(origin) {
     let currentTab = 'videos';
     let currentSort = 'latest';
     let lastToken = null;
-    let currentTargetId = 'SX_ViT4Ra7k';
-
-    const shortsIframe = document.getElementById('shortsIframe');
-    shortsIframe.addEventListener('load', () => {
-      try { shortsIframe.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}', '*'); } catch (e) {}
-    });
 
     function setMode(m) {
       currentMode = m;
@@ -1288,8 +1432,8 @@ function renderDemoHtml(origin) {
       if (m === 'search') input.value = '/api/v1/search?q=Hikakin';
       if (m === 'channel') input.value = '/api/v1/channels/@HikakinTV?tab=' + currentTab + '&sort=' + currentSort;
       if (m === 'shorts') input.value = '/api/v1/shorts/9f1rHt0W_Ak';
-      if (m === 'video') { currentTargetId = 'SX_ViT4Ra7k'; input.value = '/api/v1/videos/' + currentTargetId; }
-      if (m === 'comments') { currentTargetId = 'SX_ViT4Ra7k'; input.value = '/api/v1/comments/' + currentTargetId; }
+      if (m === 'video') input.value = '/api/v1/videos/SX_ViT4Ra7k';
+      if (m === 'comments') input.value = '/api/v1/comments/SX_ViT4Ra7k';
       if (m === 'playlist') input.value = '/api/v1/playlists/PLoSWVnSA9vG8hI-SUpAimvYJrPh-PRRvp';
       if (m === 'trending') input.value = '/api/v1/trending';
       fetchApi();
@@ -1300,11 +1444,6 @@ function renderDemoHtml(origin) {
       document.querySelectorAll('#channelControls .sub-btn').forEach(b => {
         if (b.id.startsWith('tab-')) b.classList.toggle('active', b.id === 'tab-' + t);
       });
-      const isVideoOrShort = (t === 'videos' || t === 'shorts');
-      document.getElementById('sort-latest').style.display = isVideoOrShort ? 'inline-block' : 'none';
-      document.getElementById('sort-popular').style.display = isVideoOrShort ? 'inline-block' : 'none';
-      document.getElementById('sort-oldest').style.display = (t === 'videos') ? 'inline-block' : 'none';
-
       document.getElementById('pathInput').value = '/api/v1/channels/@HikakinTV?tab=' + currentTab + '&sort=' + currentSort;
       fetchApi();
     }
@@ -1364,9 +1503,7 @@ function renderDemoHtml(origin) {
       } else if (currentMode === 'channel') {
         endpoint = '/api/v1/channels/@HikakinTV?continuation=' + encodeURIComponent(lastToken) + '&tab=' + currentTab + '&sort=' + currentSort;
       } else if (currentMode === 'comments') {
-        endpoint = '/api/v1/comments/' + currentTargetId + '?continuation=' + encodeURIComponent(lastToken);
-      } else if (currentMode === 'video') {
-        endpoint = '/api/v1/videos/' + currentTargetId + '?continuation=' + encodeURIComponent(lastToken);
+        endpoint = '/api/v1/comments/SX_ViT4Ra7k?continuation=' + encodeURIComponent(lastToken);
       }
 
       try {
